@@ -2461,7 +2461,7 @@ asyncio.run(main())
 - Playwright mở headless Chromium
 - Tự inject hook rồi tự gửi message
 
-\- Sau khi WASM tự hoàn tất handshake, script gửi 240 message `get_random`, mỗi message cách nhau 70ms, khoảng 14 req/s - không bị rate limit, rồi gửi một `identify_player` để server cấp một player JWT hợp lệ (`admin:false`)
+\- Sau khi WASM tự hoàn tất handshake, script gửi 400 message `get_random`, mỗi message cách nhau 55ms, khoảng 18 req/s - không bị rate limit, rồi gửi một `identify_player` để server cấp một player JWT hợp lệ (`admin:false`)
 
 ![alt text](images/image-37.png)
 
