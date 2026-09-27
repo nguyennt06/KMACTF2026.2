@@ -1,0 +1,9 @@
+{
+  "markdown.copyFiles.destination": {
+    "**/*": "/images/${fileName}"
+  },
+  "markdown.copyFiles.overwriteBehavior": "nameIncrementally",
+  "markdown.editor.filePaste.copyIntoWorkspace": "mediaFiles",
+  "pasteImage.path": "${projectFolder}/images",
+  "pasteImage.showFilePathConfirmInputBox": false
+}

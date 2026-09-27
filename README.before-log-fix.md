@@ -2461,7 +2461,7 @@ asyncio.run(main())
 - Playwright mở headless Chromium
 - Tự inject hook rồi tự gửi message
 
-\- Sau khi WASM tự hoàn tất handshake, script gửi 400 message `get_random`, mỗi message cách nhau 55ms, khoảng 18 req/s - không bị rate limit, rồi gửi một `identify_player` để server cấp một player JWT hợp lệ (`admin:false`)
+\- Sau khi WASM tự hoàn tất handshake, script gửi 400 message get_random, mỗi message cách nhau 55ms, khoảng 18 req/s - không bị rate limit, rồi gửi một `identify_player` để server cấp một player JWT hợp lệ (`admin:false`)
 
 ![alt text](images/image-37.png)
 
@@ -3211,16 +3211,14 @@ def plant_payload(target, payload, username, password):
 
 \- Log solver lúc này:
 ```
-[+] Bot loaded stylesheet batch 1/4 (14,614 bytes)
-[+] Callback t=39c; unique trigrams=1
-[+] Callback t=33f; unique trigrams=2
+[+] Bot loaded stylesheet batch N/4 rồi [+] Callback t=471; unique trigrams=N
 ```
 
 5. Ghép các mảnh thành ID hoàn chỉnh (Euler trail)
 
 \- ID sinh bởi `secrets.token_hex(16)` → 32 ký tự hex → đúng 30 trigram trượt. Mỗi trigram abc là một cạnh có hướng ab → bc (hai trigram liên tiếp chồng nhau 2 ký tự)
 
-\- Ghép ID bằng cách tìm đường Euler dùng mỗi cạnh đúng một lần; trong lần chạy ở ảnh, đường đi từ cặp đầu (s=d6) tới cặp cuối (e=3f).
+\- Ghép ID = tìm đường Euler dùng mỗi cạnh đúng một lần, đi từ cặp đầu (s=a4) tới cặp cuối (e=13).
 
 \- Solver kiểm tra điều kiện tồn tại đường Euler (bậc vào/ra của từng đỉnh) trước, rồi duyệt trail. 2 hàm `degree_ok()` và `euler_candidates()`
 
@@ -3244,7 +3242,7 @@ def plant_payload(target, payload, username, password):
 
 </details>
 
-\- Solver lưu trigram dạng tập duy nhất, nên `extra = 30 - len(base)` gồm cả trigram lặp trong ID và trigram chưa nhận callback. Với `extra ≤ 4`, script thử thêm các cạnh lặp; lớn hơn 4 thì chỉ báo cần fallback dò tuần tự theo tiền tố, chưa tự thực hiện fallback này.
+\- Nếu thiếu ≤ 4 trigram (do bot đóng trang trước khi phát hết callback), solver thử bù cạnh lặp (combinations_with_replacement) thay vì bỏ cuộc:
 
 ```python
     # kmapurify_solve.py:150-156
@@ -3603,7 +3601,7 @@ python3 -m pip install requests
 
 ![alt text](images/image-40.png)
 
-`requests` được solver dùng để đăng ký qua `/register` và cập nhật bio qua `/profile`
+`requests` được solver dùng để gọi các form HTTP `/register`, `/profile`, `/reset-password` và `/login`
 
 ### 2. Mở tunnel
 
