@@ -4121,13 +4121,13 @@ Thấy được `POST /api/collections/{id}/entries` nhận đầu vào là mộ
 ```json
 {
   "item": {
-    "product": "psyduck-pond",
+    "product": "...",
     "quantity": 1,
     "option": {
       "file": {
         "data_base64": "...",
-        "content_type": "image/png",
-        "filename": "test.php"
+        "content_type": "...",
+        "filename": "..."
       }
     }
   }
